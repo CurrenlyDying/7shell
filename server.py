@@ -1,3 +1,4 @@
+import functools
 import html
 import json
 import os
@@ -8,6 +9,8 @@ import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import anyio
+import anyio.to_thread
 from pydantic import AnyHttpUrl
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -36,6 +39,12 @@ DEFAULT_CWD = os.environ.get("MCP_DEFAULT_CWD", str(Path.home()))
 # sudoers rule permitting it without a password. Unset means commands run as the
 # same user as this server, which can then modify its own auth state.
 EXEC_USER = os.environ.get("MCP_EXEC_USER", "").strip()
+
+# Commands run in worker threads (see run_command). Bound how many can be in
+# flight at once with a limiter of their own, so a burst of slow commands queues
+# instead of eating the shared thread pool the rest of the app relies on.
+MAX_CONCURRENT_COMMANDS = max(1, int(os.environ.get("MCP_MAX_CONCURRENT_COMMANDS", "8")))
+_command_limiter = anyio.CapacityLimiter(MAX_CONCURRENT_COMMANDS)
 
 # Refuse to start rather than fall back to plaintext audit lines.
 REQUIRE_AUDIT_KEY = os.environ.get("MCP_REQUIRE_AUDIT_KEY", "") == "1"
@@ -101,15 +110,22 @@ def _client_ip(request: Request) -> str:
     return request.headers.get("cf-connecting-ip") or (request.client.host if request.client else "unknown")
 
 
+_audit_lock = threading.Lock()
+
+
 def _audit(line: str) -> None:
     # Keep only the timestamp in cleartext (useful for "when did this happen"
     # triage); encrypt the detail to an offline public key. With no recipient
     # key installed the detail is written as-is (file is 0600) so nothing is
     # lost. The server cannot read its own encrypted logs back.
     ts = time.strftime('%Y-%m-%dT%H:%M:%S')
-    fd = os.open(AUDIT_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    with os.fdopen(fd, "a") as f:
-        f.write(f"{ts} {audit_encrypt(line)}\n")
+    line = f"{ts} {audit_encrypt(line)}\n"
+    # Serialised because commands are audited from worker threads now, and an
+    # encrypted line is well over the size the kernel appends atomically.
+    with _audit_lock:
+        fd = os.open(AUDIT_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as f:
+            f.write(line)
 
 
 async def _read_body_limited(request: Request, max_bytes: int) -> bytes | None:
@@ -433,16 +449,12 @@ def _kill_tree(proc: subprocess.Popen) -> None:
             pass
 
 
-@mcp.tool()
-def run_command(command: str, cwd: str = DEFAULT_CWD, timeout_seconds: int = 30) -> dict:
-    """Run a shell command on this machine and return its exit code, stdout, and stderr.
+def _run_command_blocking(command: str, cwd: str, timeout_seconds: int, holder: dict) -> dict:
+    """The actual work. Runs on a worker thread; never call this from the loop.
 
-    Args:
-        command: The shell command to run (executed via `bash -lc`).
-        cwd: Working directory to run the command in.
-        timeout_seconds: Max time to allow the command to run, capped at 120s.
+    `holder` gives the caller a handle on the child so it can be killed if the
+    request is cancelled while this is still running.
     """
-    timeout_seconds = min(max(int(timeout_seconds), 1), 120)
     argv = ["bash", "-lc", command]
     if EXEC_USER:
         argv = ["sudo", "-n", "-u", EXEC_USER] + argv
@@ -465,6 +477,7 @@ def run_command(command: str, cwd: str = DEFAULT_CWD, timeout_seconds: int = 30)
     except (FileNotFoundError, NotADirectoryError, PermissionError) as e:
         _audit(f"RUN_END exit=-1 error={e!r}")
         return {"exit_code": -1, "stdout": "", "stderr": str(e), "timed_out": False}
+    holder["proc"] = proc
 
     readers = [
         threading.Thread(target=_drain, args=(proc.stdout, out), daemon=True),
@@ -497,6 +510,38 @@ def run_command(command: str, cwd: str = DEFAULT_CWD, timeout_seconds: int = 30)
         "stderr": _truncate(stderr),
         "timed_out": timed_out,
     }
+
+
+@mcp.tool()
+async def run_command(command: str, cwd: str = DEFAULT_CWD, timeout_seconds: int = 30) -> dict:
+    """Run a shell command on this machine and return its exit code, stdout, and stderr.
+
+    Args:
+        command: The shell command to run (executed via `bash -lc`).
+        cwd: Working directory to run the command in.
+        timeout_seconds: Max time to allow the command to run, capped at 120s.
+    """
+    timeout_seconds = min(max(int(timeout_seconds), 1), 120)
+
+    # The SDK calls a synchronous tool function directly on the event loop, so a
+    # blocking implementation stops the server answering anything at all for the
+    # duration, up to the full timeout. Auth endpoints included. Run the blocking
+    # part on a worker thread and keep the loop free.
+    holder: dict = {}
+    try:
+        return await anyio.to_thread.run_sync(
+            functools.partial(_run_command_blocking, command, cwd, timeout_seconds, holder),
+            abandon_on_cancel=True,
+            limiter=_command_limiter,
+        )
+    except anyio.get_cancelled_exc_class():
+        # Client went away. The thread is abandoned, so kill the child too rather
+        # than leaving it to run out its timeout unattended.
+        proc = holder.get("proc")
+        if proc is not None:
+            _kill_tree(proc)
+            _audit("RUN_CANCELLED")
+        raise
 
 
 if __name__ == "__main__":

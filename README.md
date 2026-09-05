@@ -57,7 +57,12 @@ Two things are your responsibility and cannot be fixed in this code:
   `MCP_REQUIRE_AUDIT_KEY=1` to refuse to start rather than fall back to plaintext.
 - **Bounded execution.** Output is streamed with a hard byte ceiling instead of
   being buffered whole, and a timeout kills the entire process group rather than
-  just the direct child.
+  just the direct child. Cancelling the request kills the child too.
+- **Commands do not block the server.** The MCP SDK calls a synchronous tool
+  function directly on the event loop, so a blocking implementation stops every
+  other request, auth included, for as long as the command runs. Execution is
+  offloaded to a worker thread under its own capacity limiter
+  (`MCP_MAX_CONCURRENT_COMMANDS`, default 8).
 - **Bounded public state.** Body size limits are enforced against bytes actually
   received, not a `Content-Length` header that a chunked request simply omits.
   Unauthenticated endpoints are rate limited and expired rows are swept.
