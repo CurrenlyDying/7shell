@@ -14,26 +14,53 @@ This grants **shell access as the user the service runs as**. Anyone who gets a
 valid token gets that shell. Treat the auth path as the whole security boundary,
 because it is.
 
+Two things are your responsibility and cannot be fixed in this code:
+
+- **Set `MCP_ALLOWED_REDIRECT_PREFIXES`.** Nothing registers without it, which is
+  the intended failure mode.
+- **Do not let the shell run as this service's own user.** By default it does,
+  which means an authorized command can rewrite the auth database, the trusted
+  keys, this code, and the logs, and can outlive any token you revoke. Set
+  `MCP_EXEC_USER` to a separate account and use the hardening in
+  `mcp-shell.service.example`.
+
 ## What it does
 
 - **One tool**, `run_command(command, cwd, timeout_seconds)`, executed via
   `bash -lc`, with a timeout capped server-side.
-- **OAuth 2.0 authorization server** built on the MCP SDK's provider interface,
-  with dynamic client registration enabled and token revocation supported.
+- **OAuth 2.0 authorization server** built on the MCP SDK's provider interface.
   Bearer tokens are stored only as SHA-256 hashes, so the database never holds a
-  usable token. Anonymous client registration is bounded: clients holding tokens
-  are kept, and only the most recent few token-less registrations survive, so a
-  flood of anonymous registrations cannot grow the table without limit.
+  usable token.
+- **Registration allowlist.** Dynamic client registration is open by protocol.
+  On its own that means anyone can register a client with their own callback,
+  send you its authorize link, and receive the code when you sign in on your own
+  real domain. A signature proves who you are, never who you are granting to, so
+  `MCP_ALLOWED_REDIRECT_PREFIXES` pins the callbacks that may register at all,
+  checked again at authorize time. Unset means no client can register.
+- **Named grants on the login page.** Before you sign anything the page tells you
+  which client is asking, where the code will be sent, and that continuing hands
+  over shell access.
 - **Two login methods** at the authorize step:
-  - **SSH signature.** The server issues a challenge; you sign it with an SSH
-    key using `ssh-keygen -Y sign` on a device you control and paste the
-    signature back. Verified against an `allowed_signers` file.
+  - **SSH signature.** The server issues a challenge; you sign it with
+    `ssh-keygen -Y sign` on a device you control and paste the signature back.
+    Verified against an `allowed_signers` file.
   - **WebAuthn / passkey**, registered through `/webauthn/setup`.
+- **Grant-scoped tokens.** Every token descended from one login shares a grant
+  id. Revoking any of them revokes all of them, rotation retires the access token
+  it replaces, and replaying an already-rotated refresh token is treated as a
+  compromise and ends the grant. Tokens are bound to this server's resource and
+  refused elsewhere.
 - **Write-only audit log.** Each entry's detail is encrypted to an X25519 public
   key whose private half lives off the box, so a compromise of the host does not
   hand over the command history. `decrypt_log.py` reads it back with the offline
-  key. If no recipient key is installed the line is written in the clear rather
-  than dropped.
+  key. Commands are recorded before they run as well as after. Set
+  `MCP_REQUIRE_AUDIT_KEY=1` to refuse to start rather than fall back to plaintext.
+- **Bounded execution.** Output is streamed with a hard byte ceiling instead of
+  being buffered whole, and a timeout kills the entire process group rather than
+  just the direct child.
+- **Bounded public state.** Body size limits are enforced against bytes actually
+  received, not a `Content-Length` header that a chunked request simply omits.
+  Unauthenticated endpoints are rate limited and expired rows are swept.
 - **DNS rebinding protection** left on, with the public hostname explicitly
   allowed so tunnelled requests are not rejected.
 

@@ -35,6 +35,13 @@ def _load_recipient():
         return None
 
 
+def key_available() -> bool:
+    """True if a usable recipient key is installed. Lets the server refuse to
+    start when the operator requires encrypted audit lines, instead of silently
+    falling back to plaintext."""
+    return _load_recipient() is not None
+
+
 def audit_encrypt(line: str) -> str:
     """Return 'ENC <base64>' encrypting line to the recipient key, or the line
     unchanged if no recipient key is installed."""

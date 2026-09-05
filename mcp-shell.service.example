@@ -1,5 +1,5 @@
 [Unit]
-Description=MCP shell-access server for Claude custom connector
+Description=MCP shell-access server
 After=network.target
 
 [Service]
@@ -11,6 +11,21 @@ EnvironmentFile=/opt/mcp-shell-server/.env
 ExecStart=/opt/mcp-shell-server/.venv/bin/python /opt/mcp-shell-server/server.py
 Restart=on-failure
 RestartSec=3
+
+# Damage limitation. None of this contains a shell tool that runs as this user;
+# it only narrows what that shell can reach. Pair it with MCP_EXEC_USER so
+# commands cannot rewrite the auth database or this code.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/mcp-shell-server/data /opt/mcp-shell-server/audit.log
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
 
 [Install]
 WantedBy=multi-user.target
