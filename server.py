@@ -35,7 +35,7 @@ from auth_provider import (
     USING_LEGACY_REDIRECT_VAR,
     ShellAuthProvider,
 )
-from logcrypt import audit_encrypt, key_available
+from logcrypt import AuditKeyUnavailable, audit_encrypt, key_available
 import webauthn_login
 
 BASE_URL = os.environ["MCP_BASE_URL"].rstrip("/")
@@ -143,8 +143,9 @@ mcp = FastMCP(
 )
 
 
-class AuditUnavailable(RuntimeError):
-    """Raised when an audit line cannot be written under the guarantee asked for."""
+# The encryption layer owns this, so the check and the encryption cannot
+# disagree about which key was present.
+AuditUnavailable = AuditKeyUnavailable
 
 
 def _audit_quietly(line: str) -> None:
@@ -169,14 +170,10 @@ def _audit(line: str) -> None:
     # key installed the detail is written as-is (file is 0600) so nothing is
     # lost. The server cannot read its own encrypted logs back.
     ts = time.strftime('%Y-%m-%dT%H:%M:%S')
-    # Checked per write, not once at startup. A key that is removed or corrupted
-    # while running would otherwise silently downgrade every later line to
-    # plaintext, which is the opposite of what requiring it was meant to promise.
-    if REQUIRE_AUDIT_KEY and not key_available():
-        raise AuditUnavailable(
-            "MCP_REQUIRE_AUDIT_KEY=1 but the audit recipient key is missing or invalid"
-        )
-    line = f"{ts} {audit_encrypt(line)}\n"
+    # Enforced per write and inside the encryption itself, not by a separate
+    # check beforehand. A key removed between a check and the encryption would
+    # pass the check and be written in plaintext regardless.
+    line = f"{ts} {audit_encrypt(line, require=REQUIRE_AUDIT_KEY)}\n"
     # Serialised because commands are audited from worker threads now, and an
     # encrypted line is well over the size the kernel appends atomically.
     with _audit_lock:
@@ -642,19 +639,28 @@ async def run_command(command: str, cwd: str = DEFAULT_CWD, timeout_seconds: int
 
 MAX_REQUEST_BYTES = int(os.environ.get("MCP_MAX_REQUEST_BYTES", str(1024 * 1024)))
 
-
-class _BodyTooLarge(Exception):
-    pass
+# Methods that can carry a body. Anything else is passed straight through: the
+# GET on the MCP endpoint is a long-lived event stream, and reading from it here
+# waiting for a body that never comes would stall the request.
+_BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
 
 
 class BodyLimit:
     """ASGI wrapper capping the body of every request.
 
-    The per-endpoint limits only cover the routes written here. Registration,
-    token and authorize are served by the SDK and had no limit at all, so a
-    single request with a megabyte-long client name was accepted and stored.
-    This sits in front of everything, and counts bytes as they arrive rather
-    than trusting Content-Length, which a chunked request simply omits.
+    The per-endpoint limits only cover the routes written in this module.
+    Registration, token and authorize are served by the SDK and had no limit at
+    all, so a request with a megabyte-long client name was accepted and stored.
+
+    The body is read here, before the application sees it, and the request is
+    refused outright if it runs over. An earlier version let the read raise
+    through the application instead, which the SDK's own error middleware caught
+    first and turned into a 500 before this wrapper could answer. Reading first
+    means the limit is decided in one place and the answer is always 413.
+
+    Bodies are therefore buffered up to the limit. That is fine for what this
+    server receives, since every request body here is a complete JSON or form
+    document rather than a stream.
     """
 
     def __init__(self, app, max_bytes: int) -> None:
@@ -662,9 +668,11 @@ class BodyLimit:
         self.max_bytes = max_bytes
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
+        if scope["type"] != "http" or scope.get("method", "").upper() not in _BODY_METHODS:
             return await self.app(scope, receive, send)
 
+        # Content-Length is a claim and is absent on a chunked request, so it is
+        # only ever used to refuse early, never to decide that a body is small.
         for name, value in scope.get("headers", []):
             if name == b"content-length":
                 try:
@@ -673,39 +681,40 @@ class BodyLimit:
                 except ValueError:
                     return await self._reject(send)
 
-        seen = 0
-        started = False
-
-        async def counting_receive():
-            nonlocal seen
+        body = bytearray()
+        while True:
             message = await receive()
-            if message["type"] == "http.request":
-                seen += len(message.get("body", b""))
-                if seen > self.max_bytes:
-                    raise _BodyTooLarge
-            return message
+            if message["type"] == "http.disconnect":
+                return
+            body += message.get("body", b"")
+            if len(body) > self.max_bytes:
+                return await self._reject(send)
+            if not message.get("more_body", False):
+                break
 
-        async def tracking_send(message):
-            nonlocal started
-            if message["type"] == "http.response.start":
-                started = True
-            await send(message)
+        replayed = False
 
-        try:
-            await self.app(scope, counting_receive, tracking_send)
-        except _BodyTooLarge:
-            if not started:
-                await self._reject(send)
+        async def replay():
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": bytes(body), "more_body": False}
+            # Anything after the body comes from the real transport. Returning a
+            # fabricated disconnect here instead tells a streaming response that
+            # the client has gone, and truncates it mid-stream.
+            return await receive()
+
+        await self.app(scope, replay, send)
 
     async def _reject(self, send) -> None:
-        body = b'{"error":"request too large"}'
+        payload = b'{"error":"request too large"}'
         await send({
             "type": "http.response.start",
             "status": 413,
             "headers": [(b"content-type", b"application/json"),
-                        (b"content-length", str(len(body)).encode())],
+                        (b"content-length", str(len(payload)).encode())],
         })
-        await send({"type": "http.response.body", "body": body})
+        await send({"type": "http.response.body", "body": payload})
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 # Audit handoff
 
 Written for a reviewer picking this up cold. It says what changed, what was
-checked, and more usefully what was not. Current as of the second review pass.
+checked, and more usefully what was not. Current as of the third review pass.
 
 ## What this program is
 
@@ -155,11 +155,46 @@ login and passkey setup shared one rate-limit counter, so a handful of visits to
 the setup page locked the operator out of signing in. The counters are now
 separate.
 
+## Third review, and what changed
+
+1. **The example unit did not establish a working `MCP_EXEC_USER`.** Reported on
+   the basis that several hardening directives implicitly enable
+   `NoNewPrivileges`, which blocks the setuid transition sudo needs. Tested
+   under real transient units on systemd 257: none of the directives the unit
+   shipped enabled it, and sudo worked. Adding `RestrictNamespaces` and
+   `SystemCallFilter` did enable it and did break sudo, exactly as described.
+   Rather than depend on which version behaves how, the unit now sets
+   `NoNewPrivileges=no` explicitly, which overrides the implication. Verified:
+   the full hardening set plus an explicit `no` leaves the switch working. The
+   comment says to change it to `yes` when `MCP_EXEC_USER` is unused.
+2. **Audit encryption had a check-then-use gap.** Availability was checked and
+   the key read again inside encryption, so a key removed between the two reads
+   passed the check and was written in plaintext. The requirement now lives
+   inside `audit_encrypt(require=True)`, which loads the key once.
+3. **Oversized chunked requests to SDK routes returned 500, not 413.** The read
+   raised through the application and the SDK's error middleware answered first.
+   `BodyLimit` now reads the body before dispatch and refuses outright, so the
+   answer is 413 either way. Requests without a body are passed straight
+   through, since reading from the long-lived event stream would stall it.
+4. **The deprecated variable did not survive startup.** The provider accepted
+   `MCP_ALLOWED_REDIRECT_PREFIXES` but configuration validation ran first and
+   required the new name. It is normalised before validation now.
+
+Also raised: the setup-cap test made 25 requests from one address, so the rate
+limiter rejected most and the storage cap was never exercised. The test now
+varies the source address per request.
+
+Found while fixing item 3, not reported by any review: replaying the buffered
+body and then returning a fabricated disconnect told streaming responses the
+client had gone, truncating them mid-stream. Reads after the body now come from
+the real transport.
+
 ## Tests
 
 `tests/integration_test.py` starts a real server on a spare port with a
 throwaway database and a disposable key. It covers the failure cases above, not
 just the happy paths, since happy paths are what let the first round through.
+27 checks at present.
 
 ```sh
 python tests/integration_test.py

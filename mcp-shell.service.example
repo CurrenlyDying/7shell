@@ -12,8 +12,8 @@ ExecStart=/opt/mcp-shell-server/.venv/bin/python /opt/mcp-shell-server/server.py
 Restart=on-failure
 RestartSec=3
 
-# Damage limitation. None of this stops the shell tool running as this user; it
-# only narrows what that shell can reach.
+# Damage limitation. None of this stops the shell tool running commands; it only
+# narrows what the server process itself can reach.
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
@@ -23,30 +23,26 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 RestrictRealtime=yes
+RestrictNamespaces=yes
 LockPersonality=yes
+SystemCallFilter=@system-service
 
-# NoNewPrivileges=yes is deliberately NOT set here, and the two settings below
-# are commented out, because they are incompatible with MCP_EXEC_USER.
+# Set explicitly, and it matters which value.
 #
-# Switching user through sudo needs the setuid transition that all three of
-# these block, and no sudoers rule can grant it back. Setting them while
-# MCP_EXEC_USER is configured produces a server that refuses to start, which is
-# at least honest, but it is not a working configuration.
+# MCP_EXEC_USER runs commands as a second, weaker account by way of sudo, and
+# sudo needs a setuid transition that NoNewPrivileges=yes forbids. No sudoers
+# rule can grant it back. Several of the directives above enable
+# NoNewPrivileges implicitly for a service that is not root, so leaving this
+# line out is not the same as setting it to no. Stating it wins over the
+# implication.
 #
-# Pick one:
-#   1. Use MCP_EXEC_USER and leave these off. Commands run as a weaker account
-#      that cannot touch this server's auth database or code. Recommended.
-#   2. Leave MCP_EXEC_USER unset and turn these on. Commands run as this service
-#      account, so they can rewrite its own auth state, but the process itself
-#      is more confined.
+# The cost of "no" is real: this process may gain privileges through setuid
+# binaries. That is the mechanism MCP_EXEC_USER depends on. In exchange,
+# commands stop running as the account that owns the auth database and this
+# code, which is the larger of the two risks.
 #
-# Option 1 addresses the larger risk. Neither is a substitute for the other; a
-# separate executor service running as its own user, spoken to over a socket,
-# would give both, and is the right shape if this ever grows one.
-#
-#NoNewPrivileges=yes
-#RestrictNamespaces=yes
-#SystemCallFilter=@system-service
+# If you are NOT using MCP_EXEC_USER, change this to yes and lose nothing.
+NoNewPrivileges=no
 
 [Install]
 WantedBy=multi-user.target

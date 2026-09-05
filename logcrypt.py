@@ -35,18 +35,33 @@ def _load_recipient():
         return None
 
 
+class AuditKeyUnavailable(RuntimeError):
+    """Raised by audit_encrypt(require=True) when no usable recipient key exists."""
+
+
 def key_available() -> bool:
-    """True if a usable recipient key is installed. Lets the server refuse to
-    start when the operator requires encrypted audit lines, instead of silently
-    falling back to plaintext."""
+    """True if a usable recipient key is installed. Suitable for a startup check
+    only: anything that must not write plaintext has to pass require=True to
+    audit_encrypt instead, so the decision and the encryption see the same key."""
     return _load_recipient() is not None
 
 
-def audit_encrypt(line: str) -> str:
-    """Return 'ENC <base64>' encrypting line to the recipient key, or the line
-    unchanged if no recipient key is installed."""
+def audit_encrypt(line: str, require: bool = False) -> str:
+    """Return 'ENC <base64>' encrypting line to the recipient key.
+
+    With require=False, a missing key means the line is returned unchanged, so
+    events are never silently dropped. With require=True a missing key raises.
+
+    The key is loaded exactly once here. Checking availability separately and
+    then calling this would read the file twice, and a key removed between the
+    two reads would pass the check and then be written in plaintext anyway.
+    """
     recipient = _load_recipient()
     if recipient is None:
+        if require:
+            raise AuditKeyUnavailable(
+                "audit encryption is required but data/log_recipient.pub is missing or invalid"
+            )
         return line
     eph = X25519PrivateKey.generate()
     shared = eph.exchange(recipient)

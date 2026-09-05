@@ -130,6 +130,35 @@ def make_tmp() -> Path:
     return tmp
 
 
+def chunked_post(path: str, size: int) -> int:
+    """POST `size` bytes with no Content-Length, using chunked encoding. Returns
+    the status code. Raw sockets, because urllib always sets Content-Length."""
+    import socket
+    payload = b'{"client_name":"' + b"x" * size + b'"}'
+    head = (f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\n"
+            "Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n"
+            "Connection: close\r\n\r\n").encode()
+    with socket.create_connection(("127.0.0.1", PORT), timeout=20) as s:
+        s.sendall(head)
+        try:
+            for i in range(0, len(payload), 16384):
+                part = payload[i:i + 16384]
+                s.sendall(f"{len(part):x}\r\n".encode() + part + b"\r\n")
+            s.sendall(b"0\r\n\r\n")
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the server may answer and close before the body finishes
+        s.shutdown(socket.SHUT_WR)
+        buf = b""
+        while b"\r\n" not in buf and len(buf) < 4096:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+    first = buf.split(b"\r\n", 1)[0].decode("utf-8", "replace")
+    parts = first.split()
+    return int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+
+
 def register(callback=CALLBACK, name="TestApp", **extra):
     body = {"client_name": name, "redirect_uris": [callback],
             "grant_types": ["authorization_code", "refresh_token"],
@@ -219,17 +248,24 @@ def test_regressions(tmp):
         check("exact callback accepted", register(CALLBACK)[0] == 201)
 
         # Setup sessions are capped by the endpoint that creates them, not only
-        # by a sweep that unauthenticated traffic never triggers.
-        for _ in range(25):
-            http("/webauthn/setup")
+        # by a sweep that unauthenticated traffic never triggers. Each request
+        # carries a different source address, or the per-IP limiter would reject
+        # most of them and the cap would never be exercised at all.
+        for i in range(25):
+            http("/webauthn/setup", headers={"cf-connecting-ip": f"198.51.100.{i}"})
         db = sqlite3.connect(tmp / "data" / "store.sqlite3")
         rows = db.execute("SELECT count(*) FROM webauthn_setup_sessions").fetchone()[0]
         db.close()
         check("setup sessions capped at 20", rows <= 20, f"{rows} rows")
 
-        # The SDK's own routes are behind the body limit too.
+        # The SDK's own routes are behind the body limit too, whether or not the
+        # request announces its size. Chunked used to surface as 500, because the
+        # SDK's error middleware answered before the limit could.
         status, _, _ = register(CALLBACK, name="x" * 2_000_000)
         check("oversized registration rejected", status == 413, f"got {status}")
+        check("oversized chunked registration rejected",
+              chunked_post("/register", 2_000_000) == 413,
+              f"got {chunked_post('/register', 2_000_000)}")
 
         # Grant revocation on a current token.
         cid = json.loads(register(CALLBACK)[1])["client_id"]
@@ -318,14 +354,47 @@ def test_audit_required_at_write_time(tmp):
     check("audit refuses to write plaintext when a key is required", raised)
     check("no plaintext line was appended",
           "TEST after key removal" not in (tmp / "audit.log").read_text())
+    # The race: a key present when availability is checked and gone by the time
+    # the line is encrypted. Encryption loads the key once and decides for
+    # itself, so there is no window between the two.
+    import logcrypt
+    key2 = X25519PrivateKey.generate()
+    pub.write_text(base64.b64encode(
+        key2.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode())
+    check("key reports available", logcrypt.key_available())
+    pub.unlink()
+    raced = False
+    try:
+        logcrypt.audit_encrypt("TEST raced", require=True)
+    except logcrypt.AuditKeyUnavailable:
+        raced = True
+    check("encryption refuses after the key vanishes post-check", raced)
+
     del os.environ["MCP_REQUIRE_AUDIT_KEY"]
     sys.path.remove(str(tmp))
+
+
+def test_legacy_env_name(tmp):
+    """The deprecated variable has to work through real startup, not only in the
+    provider. Configuration validation runs first and looks for the new name."""
+    env = {"MCP_ALLOWED_REDIRECT_PREFIXES": CALLBACK}
+    server = Server(tmp, env)
+    del server.env["MCP_ALLOWED_REDIRECT_URIS"]
+    try:
+        with server:
+            check("deprecated variable still starts the server", True)
+            check("deprecated variable is honoured", register(CALLBACK)[0] == 201)
+            check("deprecated variable still rejects others",
+                  register("https://evil.example.com/cb")[0] == 400)
+    except RuntimeError as e:
+        check("deprecated variable still starts the server", False, str(e)[:120])
 
 
 def main() -> int:
     tmp = make_tmp()
     try:
         test_regressions(tmp)
+        test_legacy_env_name(tmp)
         test_resource_case(tmp)
         test_cancellation_race(tmp)
         test_audit_required_at_write_time(tmp)

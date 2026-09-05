@@ -423,8 +423,22 @@ def run_setup() -> dict[str, str]:
     return values
 
 
+def normalise_legacy_names() -> None:
+    """Accept the old variable names, before anything validates or reads them.
+
+    MCP_ALLOWED_REDIRECT_PREFIXES was renamed when matching changed from prefix
+    to exact. The provider reads either, but the required-settings check does
+    not, so without this a config using only the old name fails to start while
+    claiming the old name is still supported.
+    """
+    legacy = os.environ.get("MCP_ALLOWED_REDIRECT_PREFIXES", "").strip()
+    if legacy and not os.environ.get("MCP_ALLOWED_REDIRECT_URIS", "").strip():
+        os.environ["MCP_ALLOWED_REDIRECT_URIS"] = legacy
+
+
 def ensure_configured(force: bool = False) -> None:
     load_env_file()
+    normalise_legacy_names()
     missing = [k for k in REQUIRED if not os.environ.get(k)]
     if not force and not missing:
         return

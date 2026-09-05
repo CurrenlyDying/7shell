@@ -59,7 +59,9 @@ SIGNATURE_NAMESPACE = "mcp-login"
 # depend on remembering that.
 _LEGACY_REDIRECT_ENV = os.environ.get("MCP_ALLOWED_REDIRECT_PREFIXES", "")
 _REDIRECT_ENV = os.environ.get("MCP_ALLOWED_REDIRECT_URIS", "")
-USING_LEGACY_REDIRECT_VAR = bool(_LEGACY_REDIRECT_ENV and not _REDIRECT_ENV)
+# True whenever the deprecated name is present, including after config.py has
+# copied its value across, so the notice still prints.
+USING_LEGACY_REDIRECT_VAR = bool(_LEGACY_REDIRECT_ENV)
 
 # Login rate limiting: per source IP, max attempts within the window.
 LOGIN_MAX_ATTEMPTS = 5
