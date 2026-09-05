@@ -1,0 +1,16 @@
+[Unit]
+Description=MCP shell-access server for Claude custom connector
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+Group=YOUR_GROUP
+WorkingDirectory=/opt/mcp-shell-server
+EnvironmentFile=/opt/mcp-shell-server/.env
+ExecStart=/opt/mcp-shell-server/.venv/bin/python /opt/mcp-shell-server/server.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

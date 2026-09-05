@@ -1,0 +1,12 @@
+# Secrets and runtime state — never commit
+.env
+data/
+*.sqlite3
+audit.log
+audit.log.*
+.backups/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
