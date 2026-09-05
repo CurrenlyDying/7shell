@@ -263,9 +263,9 @@ def test_regressions(tmp):
         # SDK's error middleware answered before the limit could.
         status, _, _ = register(CALLBACK, name="x" * 2_000_000)
         check("oversized registration rejected", status == 413, f"got {status}")
+        chunked_status = chunked_post("/register", 2_000_000)
         check("oversized chunked registration rejected",
-              chunked_post("/register", 2_000_000) == 413,
-              f"got {chunked_post('/register', 2_000_000)}")
+              chunked_status == 413, f"got {chunked_status}")
 
         # Grant revocation on a current token.
         cid = json.loads(register(CALLBACK)[1])["client_id"]

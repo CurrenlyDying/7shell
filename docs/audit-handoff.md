@@ -227,21 +227,31 @@ python tests/integration_test.py
 
 ## Suggested lines of attack
 
-More useful than re-deriving the above:
+More useful than re-deriving what three reviews have already covered.
 
-- Can a client registered while `MCP_ALLOWED_REDIRECT_PREFIXES` was unset still
-  complete an authorization? The authorize-time check is meant to close this.
-- Does prefix matching on `redirect_uri` admit anything it should not?
-  `https://claude.ai/api/mcp/auth_callback` as a prefix, and what a crafted
-  URL can do with it.
-- Is the grant-wide revocation reachable for every token shape, including one
-  issued before the migration where `grant_id` is NULL?
-- Can the refresh replay detection be turned into a denial of service against
-  the legitimate client?
-- Does `_read_body_limited` interact badly with any transfer encoding or with
-  the proxy in front?
-- Is the per-IP rate limiter meaningful given the IP is derived from headers?
-- WebAuthn, all of it.
+- **The rate limiter trusts a header.** `_client_ip` takes `cf-connecting-ip`
+  when present, so anyone who can reach the origin directly rather than through
+  the tunnel chooses their own identity, and with it their own budget. The
+  reference deployment binds to loopback, which makes this local-only, but the
+  code does not enforce that and nothing checks the header came from the proxy.
+- **`BodyLimit` buffers.** Every in-flight POST holds up to
+  `MCP_MAX_REQUEST_BYTES` in memory before the application sees it. Concurrency
+  times that ceiling is the exposure, and nothing bounds concurrency.
+- **Refresh replay ends the grant.** Anyone who obtains one used refresh token
+  can disconnect the legitimate client at will. Is that reachable without
+  already holding a valid token?
+- **`complete_login` re-checks the callback, `load_authorization_code` does
+  not.** Is there an ordering where a code outlives the allowlist that
+  authorised it?
+- **Grant deletion is by `grant_id` string equality.** Confirm no path can
+  write a NULL or duplicate one now that the startup migration deletes
+  grantless rows.
+- **The purge is throttled to once a minute and runs inside request handling.**
+  What does it cost on a large table, and can that be provoked?
+- **WebAuthn with a real authenticator.** Software credentials have been
+  exercised; hardware and browser behaviour have not.
+- **The MCP SDK.** PKCE, code reuse, metadata, client authentication all live
+  there and none of it has been reviewed here.
 
 ## Reproducing the test environment
 
