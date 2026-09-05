@@ -30,7 +30,7 @@ from webauthn.helpers.structs import (
     UserVerificationRequirement,
 )
 
-from auth_provider import ShellAuthProvider, _connect, _lock
+from auth_provider import MAX_SETUP_SESSIONS, ShellAuthProvider, _connect, _lock
 
 SETUP_NAMESPACE = "mcp-webauthn-setup"
 SETUP_SESSION_TTL_SECONDS = 10 * 60
@@ -75,6 +75,17 @@ def start_setup() -> tuple[str, str]:
         conn.execute(
             "INSERT INTO webauthn_setup_sessions (session_id, nonce, expires_at) VALUES (?, ?, ?)",
             (session_id, nonce, time.time() + SETUP_SESSION_TTL_SECONDS),
+        )
+        # Enforced here, in the one place that creates these rows, and not on a
+        # throttle. This endpoint needs no authentication, so a cap applied only
+        # from elsewhere is a cap that anonymous traffic can simply walk past.
+        conn.execute("DELETE FROM webauthn_setup_sessions WHERE expires_at < ?", (time.time(),))
+        conn.execute(
+            """DELETE FROM webauthn_setup_sessions
+                WHERE session_id NOT IN (
+                    SELECT session_id FROM webauthn_setup_sessions
+                     ORDER BY expires_at DESC LIMIT ?)""",
+            (MAX_SETUP_SESSIONS,),
         )
     return session_id, nonce
 

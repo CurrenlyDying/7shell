@@ -29,7 +29,12 @@ from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, Re
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from auth_provider import ALLOWED_REDIRECT_PREFIXES, SIGNATURE_NAMESPACE, ShellAuthProvider
+from auth_provider import (
+    ALLOWED_REDIRECT_URIS,
+    SIGNATURE_NAMESPACE,
+    USING_LEGACY_REDIRECT_VAR,
+    ShellAuthProvider,
+)
 from logcrypt import audit_encrypt, key_available
 import webauthn_login
 
@@ -62,12 +67,35 @@ if REQUIRE_AUDIT_KEY and not key_available():
         "MCP_REQUIRE_AUDIT_KEY=1 but data/log_recipient.pub is missing or invalid; "
         "install a valid X25519 recipient key or unset the variable."
     )
-if not ALLOWED_REDIRECT_PREFIXES:
+if not ALLOWED_REDIRECT_URIS:
     print(
-        "WARNING: MCP_ALLOWED_REDIRECT_PREFIXES is unset, so no client can register. "
+        "WARNING: MCP_ALLOWED_REDIRECT_URIS is unset, so no client can register. "
         "Set it to the callback URLs you trust.",
         flush=True,
     )
+if USING_LEGACY_REDIRECT_VAR:
+    print(
+        "NOTE: MCP_ALLOWED_REDIRECT_PREFIXES is deprecated and its values are now "
+        "matched exactly rather than as prefixes. Rename it to "
+        "MCP_ALLOWED_REDIRECT_URIS and list full callback URLs.",
+        flush=True,
+    )
+if EXEC_USER:
+    # Checked once at startup rather than discovered on every command. The most
+    # common cause of failure is a service unit with NoNewPrivileges=yes, which
+    # blocks the setuid transition sudo needs and cannot be overridden by a
+    # sudoers rule.
+    _probe = subprocess.run(
+        ["sudo", "-n", "-u", EXEC_USER, "true"], capture_output=True, text=True
+    )
+    if _probe.returncode != 0:
+        raise SystemExit(
+            f"MCP_EXEC_USER={EXEC_USER} but switching to that account failed: "
+            f"{(_probe.stderr or '').strip() or 'no error output'}\n"
+            "The account must exist, this service needs a passwordless sudoers rule "
+            "for it, and the unit must not set NoNewPrivileges=yes, which blocks the "
+            "transition sudo requires."
+        )
 
 # A session id plus an SSH signature block is a few hundred bytes; cap well
 # above that so a malformed/oversized login POST can't force a large allocation.
@@ -115,6 +143,19 @@ mcp = FastMCP(
 )
 
 
+class AuditUnavailable(RuntimeError):
+    """Raised when an audit line cannot be written under the guarantee asked for."""
+
+
+def _audit_quietly(line: str) -> None:
+    """Audit where the caller has nothing useful to do about a failure, such as
+    after the command has already run. The event is reported rather than lost."""
+    try:
+        _audit(line)
+    except AuditUnavailable as e:
+        print(f"AUDIT FAILED, event not recorded: {e}: {line}", file=sys.stderr, flush=True)
+
+
 def _client_ip(request: Request) -> str:
     return request.headers.get("cf-connecting-ip") or (request.client.host if request.client else "unknown")
 
@@ -128,6 +169,13 @@ def _audit(line: str) -> None:
     # key installed the detail is written as-is (file is 0600) so nothing is
     # lost. The server cannot read its own encrypted logs back.
     ts = time.strftime('%Y-%m-%dT%H:%M:%S')
+    # Checked per write, not once at startup. A key that is removed or corrupted
+    # while running would otherwise silently downgrade every later line to
+    # plaintext, which is the opposite of what requiring it was meant to promise.
+    if REQUIRE_AUDIT_KEY and not key_available():
+        raise AuditUnavailable(
+            "MCP_REQUIRE_AUDIT_KEY=1 but the audit recipient key is missing or invalid"
+        )
     line = f"{ts} {audit_encrypt(line)}\n"
     # Serialised because commands are audited from worker threads now, and an
     # encrypted line is well over the size the kernel appends atomically.
@@ -295,13 +343,15 @@ async def webauthn_setup(request: Request):
     if request.method == "GET":
         # Unauthenticated and it writes a row, so it needs the same per-IP budget
         # as a login attempt or it is a free way to grow the database.
-        if provider.is_blocked(ip):
-            _audit(f"WEBAUTHN_SETUP_RATE_LIMITED ip={ip}")
+        # Its own budget, separate from login. Sharing one would mean a few
+        # visits to this page locked the operator out of signing in.
+        if provider.is_blocked(ip, "webauthn-setup"):
+            _audit_quietly(f"WEBAUTHN_SETUP_RATE_LIMITED ip={ip}")
             return HTMLResponse(
                 webauthn_login.message_page_html("Too many attempts. Try again later."),
                 status_code=429,
             )
-        provider.record_failed_attempt(ip)
+        provider.record_failed_attempt(ip, "webauthn-setup")
         session_id, nonce = webauthn_login.start_setup()
         return HTMLResponse(webauthn_login.setup_form_html(session_id, nonce))
 
@@ -458,35 +508,72 @@ def _kill_tree(proc: subprocess.Popen) -> None:
             pass
 
 
-def _run_command_blocking(command: str, cwd: str, timeout_seconds: int, holder: dict) -> dict:
-    """The actual work. Runs on a worker thread; never call this from the loop.
+class _Job:
+    """Shared state between the worker thread running a command and the request
+    that may be cancelled out from under it.
 
-    `holder` gives the caller a handle on the child so it can be killed if the
-    request is cancelled while this is still running.
+    Without the flag there is a window: cancellation arrives, finds no process
+    handle because the worker has not reached Popen yet, kills nothing, and the
+    abandoned worker then starts the command anyway. Claiming the job under a
+    lock closes it. Either cancel sees the process and kills it, or it marks the
+    job dead before the process exists and the worker never starts one.
     """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
+        self._cancelled = False
+
+    def start(self, argv: list[str], cwd: str) -> subprocess.Popen | None:
+        with self._lock:
+            if self._cancelled:
+                return None
+            proc = subprocess.Popen(
+                argv,
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,  # own process group, so the tree is killable
+            )
+            self._proc = proc
+            return proc
+
+    def cancel(self) -> bool:
+        with self._lock:
+            self._cancelled = True
+            proc = self._proc
+        if proc is not None:
+            _kill_tree(proc)
+            return True
+        return False
+
+
+def _run_command_blocking(command: str, cwd: str, timeout_seconds: int, job: _Job) -> dict:
+    """The actual work. Runs on a worker thread; never call this from the loop."""
     argv = ["bash", "-lc", command]
     if EXEC_USER:
         argv = ["sudo", "-n", "-u", EXEC_USER] + argv
 
     # Logged before execution, so a command that takes the server down with it
-    # still leaves a record that it was attempted.
-    _audit(f"RUN_START user={EXEC_USER or 'self'} cwd={cwd!r} command={command!r}")
+    # still leaves a record that it was attempted. If the audit line cannot be
+    # written under the guarantee configured, the command does not run at all.
+    try:
+        _audit(f"RUN_START user={EXEC_USER or 'self'} cwd={cwd!r} command={command!r}")
+    except AuditUnavailable as e:
+        return {"exit_code": -1, "stdout": "", "stderr": f"refused: {e}", "timed_out": False}
 
     out = {"parts": [], "kept": 0, "dropped": 0}
     err = {"parts": [], "kept": 0, "dropped": 0}
     timed_out = False
     try:
-        proc = subprocess.Popen(
-            argv,
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,  # own process group, so the whole tree is killable
-        )
+        proc = job.start(argv, cwd)
     except (FileNotFoundError, NotADirectoryError, PermissionError) as e:
-        _audit(f"RUN_END exit=-1 error={e!r}")
+        _audit_quietly(f"RUN_END exit=-1 error={e!r}")
         return {"exit_code": -1, "stdout": "", "stderr": str(e), "timed_out": False}
-    holder["proc"] = proc
+    if proc is None:
+        # Cancelled before the process existed. Nothing ran.
+        _audit_quietly("RUN_CANCELLED before_start=1")
+        return {"exit_code": -1, "stdout": "", "stderr": "cancelled", "timed_out": False}
 
     readers = [
         threading.Thread(target=_drain, args=(proc.stdout, out), daemon=True),
@@ -511,7 +598,7 @@ def _run_command_blocking(command: str, cwd: str, timeout_seconds: int, holder: 
     if timed_out:
         stderr += "\n[command timed out; process group killed]"
 
-    _audit(f"RUN_END exit={exit_code} timed_out={timed_out} bytes={out['kept'] + err['kept']}")
+    _audit_quietly(f"RUN_END exit={exit_code} timed_out={timed_out} bytes={out['kept'] + err['kept']}")
 
     return {
         "exit_code": exit_code,
@@ -536,22 +623,99 @@ async def run_command(command: str, cwd: str = DEFAULT_CWD, timeout_seconds: int
     # blocking implementation stops the server answering anything at all for the
     # duration, up to the full timeout. Auth endpoints included. Run the blocking
     # part on a worker thread and keep the loop free.
-    holder: dict = {}
+    job = _Job()
     try:
         return await anyio.to_thread.run_sync(
-            functools.partial(_run_command_blocking, command, cwd, timeout_seconds, holder),
+            functools.partial(_run_command_blocking, command, cwd, timeout_seconds, job),
             abandon_on_cancel=True,
             limiter=_command_limiter,
         )
     except anyio.get_cancelled_exc_class():
-        # Client went away. The thread is abandoned, so kill the child too rather
-        # than leaving it to run out its timeout unattended.
-        proc = holder.get("proc")
-        if proc is not None:
-            _kill_tree(proc)
-            _audit("RUN_CANCELLED")
+        # Client went away. The worker thread is abandoned, so the child has to be
+        # dealt with here; and if it has not started yet, prevented from starting.
+        if job.cancel():
+            _audit_quietly("RUN_CANCELLED killed=1")
+        else:
+            _audit_quietly("RUN_CANCELLED killed=0")
         raise
 
 
+MAX_REQUEST_BYTES = int(os.environ.get("MCP_MAX_REQUEST_BYTES", str(1024 * 1024)))
+
+
+class _BodyTooLarge(Exception):
+    pass
+
+
+class BodyLimit:
+    """ASGI wrapper capping the body of every request.
+
+    The per-endpoint limits only cover the routes written here. Registration,
+    token and authorize are served by the SDK and had no limit at all, so a
+    single request with a megabyte-long client name was accepted and stored.
+    This sits in front of everything, and counts bytes as they arrive rather
+    than trusting Content-Length, which a chunked request simply omits.
+    """
+
+    def __init__(self, app, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        for name, value in scope.get("headers", []):
+            if name == b"content-length":
+                try:
+                    if int(value) > self.max_bytes:
+                        return await self._reject(send)
+                except ValueError:
+                    return await self._reject(send)
+
+        seen = 0
+        started = False
+
+        async def counting_receive():
+            nonlocal seen
+            message = await receive()
+            if message["type"] == "http.request":
+                seen += len(message.get("body", b""))
+                if seen > self.max_bytes:
+                    raise _BodyTooLarge
+            return message
+
+        async def tracking_send(message):
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.app(scope, counting_receive, tracking_send)
+        except _BodyTooLarge:
+            if not started:
+                await self._reject(send)
+
+    async def _reject(self, send) -> None:
+        body = b'{"error":"request too large"}'
+        await send({
+            "type": "http.response.start",
+            "status": 413,
+            "headers": [(b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode())],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    import uvicorn
+
+    # Built here rather than via mcp.run() so the body limit can be wrapped
+    # around the SDK's routes as well as this module's.
+    uvicorn.run(
+        BodyLimit(mcp.streamable_http_app(), MAX_REQUEST_BYTES),
+        host=HOST,
+        port=PORT,
+        log_level="info",
+    )

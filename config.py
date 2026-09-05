@@ -24,7 +24,7 @@ DATA_DIR = Path(__file__).parent / "data"
 ALLOWED_SIGNERS = DATA_DIR / "allowed_signers"
 RECIPIENT_PUB = DATA_DIR / "log_recipient.pub"
 
-REQUIRED = ("MCP_BASE_URL", "MCP_ALLOWED_REDIRECT_PREFIXES")
+REQUIRED = ("MCP_BASE_URL", "MCP_ALLOWED_REDIRECT_URIS")
 
 CLAUDE_CALLBACKS = "https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback"
 
@@ -323,14 +323,16 @@ def run_setup() -> dict[str, str]:
         genuine address, you sign in as normal, and the ticket goes to them
         instead of you. Nothing about the page would look wrong.
 
-        The fix is this list. Only apps whose return address starts with
-        something on it are allowed to ask at all. Everything else is turned
-        away before you ever see a page.
+        The fix is this list. Only apps whose return address is exactly one of
+        these are allowed to ask at all. Everything else is turned away before
+        you ever see a page. It has to be the whole address, not the start of
+        one, because "starts with https://good.example" would also accept
+        https://good.example.someone-elses-domain.com.
 
         The suggested answer covers Claude, which is what most people want. Add
         others separated by commas if you know you need them."""
     )
-    prefixes = _ask("Allowed return addresses", CLAUDE_CALLBACKS, required=True)
+    callbacks = _ask("Allowed return addresses", CLAUDE_CALLBACKS, required=True)
 
     _heading(3, total, "A name for your key")
     _para(
@@ -394,7 +396,7 @@ def run_setup() -> dict[str, str]:
         "MCP_BASE_URL": base_url.rstrip("/"),
         "HOST": host,
         "PORT": port,
-        "MCP_ALLOWED_REDIRECT_PREFIXES": prefixes,
+        "MCP_ALLOWED_REDIRECT_URIS": callbacks,
         "MCP_SIGNATURE_PRINCIPAL": principal,
         "MCP_WEBAUTHN_USER_ID": principal,
         "MCP_WEBAUTHN_USER_NAME": principal,

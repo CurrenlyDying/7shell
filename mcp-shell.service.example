@@ -12,10 +12,8 @@ ExecStart=/opt/mcp-shell-server/.venv/bin/python /opt/mcp-shell-server/server.py
 Restart=on-failure
 RestartSec=3
 
-# Damage limitation. None of this contains a shell tool that runs as this user;
-# it only narrows what that shell can reach. Pair it with MCP_EXEC_USER so
-# commands cannot rewrite the auth database or this code.
-NoNewPrivileges=yes
+# Damage limitation. None of this stops the shell tool running as this user; it
+# only narrows what that shell can reach.
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
@@ -26,6 +24,29 @@ ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 RestrictRealtime=yes
 LockPersonality=yes
+
+# NoNewPrivileges=yes is deliberately NOT set here, and the two settings below
+# are commented out, because they are incompatible with MCP_EXEC_USER.
+#
+# Switching user through sudo needs the setuid transition that all three of
+# these block, and no sudoers rule can grant it back. Setting them while
+# MCP_EXEC_USER is configured produces a server that refuses to start, which is
+# at least honest, but it is not a working configuration.
+#
+# Pick one:
+#   1. Use MCP_EXEC_USER and leave these off. Commands run as a weaker account
+#      that cannot touch this server's auth database or code. Recommended.
+#   2. Leave MCP_EXEC_USER unset and turn these on. Commands run as this service
+#      account, so they can rewrite its own auth state, but the process itself
+#      is more confined.
+#
+# Option 1 addresses the larger risk. Neither is a substitute for the other; a
+# separate executor service running as its own user, spoken to over a socket,
+# would give both, and is the right shape if this ever grows one.
+#
+#NoNewPrivileges=yes
+#RestrictNamespaces=yes
+#SystemCallFilter=@system-service
 
 [Install]
 WantedBy=multi-user.target

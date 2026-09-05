@@ -1,7 +1,7 @@
 # Audit handoff
 
 Written for a reviewer picking this up cold. It says what changed, what was
-checked, and more usefully what was not. Current as of commit `1db2790`.
+checked, and more usefully what was not. Current as of the second review pass.
 
 ## What this program is
 
@@ -35,6 +35,7 @@ findings. Four commits followed:
 | `f429b9c` | Commands blocked the event loop, found while testing the above |
 | `b79daa1` | Configuration loading and first-run setup |
 | `1db2790` | Wording of the setup prompts, no behaviour change |
+| this one | Second review: legacy tokens, setup cap, cancellation race, exact callbacks, service unit, audit enforcement |
 
 ## What changed, by finding
 
@@ -117,28 +118,64 @@ disposable key, not against the live deployment:
 - First-run setup output alone boots a server with the allowlist active
 - A generated audit key round trips through `decrypt_log.py`
 
-## What was not verified
+## Second review, and what changed
 
-Worth attacking, because nothing here has been checked:
+A follow-up review confirmed the first round of fixes and found six more. All
+six are addressed:
 
-- **WebAuthn end to end.** No browser was involved. Registration and
-  authentication were exercised only through the setup signature path and
-  `test_webauthn_setup.py`. Origin, RP id, challenge and sign count handling
-  were read, not executed.
-- **The MCP SDK itself.** Treated as trusted. PKCE verification, code reuse,
-  metadata endpoints and client authentication all live there.
-- **Concurrency of the storage layer.** Commands now run in worker threads
-  while requests are served concurrently. The tool thread touches no database,
-  and writes are guarded by a process-wide lock, but this reasoning has not been
-  stress tested.
-- **The rate limiter.** In-memory, per process, keyed on an IP taken from
-  request headers behind a proxy. Not tested for spoofing or for behaviour
-  across a restart.
-- **Anything about the live host.** Proxy configuration, file modes, sudo
-  rules, installed versions.
-- **The tests themselves are not in the repo.** They were ad hoc scripts
-  against a scratch instance. There is no committed suite to re-run, which is
-  a real gap for a project asking to be trusted.
+1. **Legacy tokens escaped grant revocation.** Tokens issued before grant
+   tracking had `grant_id` NULL, so revoking one deleted only itself. Nothing
+   was ever stored that says which of them belonged together, so they cannot be
+   repaired. They are deleted at startup instead, permanently, as an invariant:
+   no grant, no token. The cost is reconnecting once after upgrading.
+2. **The setup-session cap was not enforced where sessions are created.**
+   Cleanup ran from OAuth registration and authorize, neither of which an
+   anonymous visitor to `/webauthn/setup` touches. The cap now runs inside
+   `start_setup`, unthrottled. Separately, the SDK's own routes had no body
+   limit at all; a `BodyLimit` ASGI wrapper now sits in front of everything.
+3. **Cancellation could race process creation.** Cancelling before the worker
+   reached `Popen` killed nothing and the abandoned worker then started the
+   command. `_Job` claims the job under a lock, so either cancel kills a running
+   process or marks the job dead before one exists.
+4. **Prefix matching on callbacks was a trap.** `https://good.example` also
+   matched `https://good.example.attacker.invalid/cb`. Matching is now exact.
+   The setting is `MCP_ALLOWED_REDIRECT_URIS`; the old name still works, is
+   matched exactly, and prints a deprecation notice.
+5. **The example unit contradicted itself.** `NoNewPrivileges=yes` blocks the
+   setuid transition `sudo` needs, so it cannot coexist with `MCP_EXEC_USER`. It
+   is commented out with the tradeoff explained, and the server now probes the
+   user switch at startup and refuses to run if it will not work.
+6. **Required audit encryption was checked only at startup.** It is now checked
+   on every write. If the key disappears while running, `_audit` raises rather
+   than writing plaintext, and a command whose start cannot be recorded does not
+   run.
+
+Found while writing the tests for the above, not reported by either review:
+login and passkey setup shared one rate-limit counter, so a handful of visits to
+the setup page locked the operator out of signing in. The counters are now
+separate.
+
+## Tests
+
+`tests/integration_test.py` starts a real server on a spare port with a
+throwaway database and a disposable key. It covers the failure cases above, not
+just the happy paths, since happy paths are what let the first round through.
+
+```sh
+python tests/integration_test.py
+```
+
+## What is still not verified
+
+- **WebAuthn in a browser.** The follow-up review exercised the cryptographic
+  verification with a software credential, which is more than was done here.
+  Real authenticator behaviour is still untested.
+- **The MCP SDK itself.** Treated as trusted. PKCE, code reuse, metadata
+  endpoints and client authentication live there.
+- **The rate limiter under a proxy.** In-memory, per process, keyed on an IP
+  derived from request headers. Not tested for spoofing or across a restart.
+- **Anything about a live host.** Proxy rules, file modes, sudo configuration,
+  installed versions.
 
 ## Known open items
 

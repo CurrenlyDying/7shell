@@ -16,7 +16,7 @@ because it is.
 
 Two things are your responsibility and cannot be fixed in this code:
 
-- **Set `MCP_ALLOWED_REDIRECT_PREFIXES`.** Nothing registers without it, which is
+- **Set `MCP_ALLOWED_REDIRECT_URIS`.** Nothing registers without it, which is
   the intended failure mode.
 - **Do not let the shell run as this service's own user.** By default it does,
   which means an authorized command can rewrite the auth database, the trusted
@@ -35,8 +35,10 @@ Two things are your responsibility and cannot be fixed in this code:
   On its own that means anyone can register a client with their own callback,
   send you its authorize link, and receive the code when you sign in on your own
   real domain. A signature proves who you are, never who you are granting to, so
-  `MCP_ALLOWED_REDIRECT_PREFIXES` pins the callbacks that may register at all,
-  checked again at authorize time. Unset means no client can register.
+  `MCP_ALLOWED_REDIRECT_URIS` pins the exact callbacks that may register, checked
+  again at authorize and once more before a code is issued. Matching is exact,
+  since a prefix of `https://good.example` also matches
+  `https://good.example.attacker.invalid`. Unset means no client can register.
 - **Named grants on the login page.** Before you sign anything the page tells you
   which client is asking, where the code will be sent, and that continuing hands
   over shell access.
@@ -80,6 +82,7 @@ Two things are your responsibility and cannot be fixed in this code:
 | `decrypt_log.py` | Offline reader for the audit log |
 | `test_webauthn_setup.py` | Checks for the WebAuthn setup path |
 | `config.py` | Loads `.env`, and the first-run setup that writes it |
+| `tests/integration_test.py` | Integration tests against a throwaway instance |
 
 ## Install
 

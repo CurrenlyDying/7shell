@@ -17,6 +17,7 @@ import tempfile
 import time
 from pathlib import Path
 from threading import Lock
+from urllib.parse import urlparse
 
 from pydantic import AnyUrl
 
@@ -50,11 +51,15 @@ SIGNATURE_NAMESPACE = "mcp-login"
 # without this anyone can register a client pointing at their own callback, send
 # you its authorize link, and receive the code when you sign in on your own real
 # domain. Proving you hold the key says nothing about who you are granting to,
-# so the set of acceptable callbacks has to be pinned out of band. Comma-separated
-# prefixes; empty means refuse every registration.
-ALLOWED_REDIRECT_PREFIXES = tuple(
-    p.strip() for p in os.environ.get("MCP_ALLOWED_REDIRECT_PREFIXES", "").split(",") if p.strip()
-)
+# so the set of acceptable callbacks has to be pinned out of band.
+#
+# Matching is exact, not by prefix. A prefix of "https://good.example" also
+# matches "https://good.example.attacker.invalid/cb", and a prefix ending "/cb"
+# also matches "/cb-attacker". Whether an operator's setting is safe should not
+# depend on remembering that.
+_LEGACY_REDIRECT_ENV = os.environ.get("MCP_ALLOWED_REDIRECT_PREFIXES", "")
+_REDIRECT_ENV = os.environ.get("MCP_ALLOWED_REDIRECT_URIS", "")
+USING_LEGACY_REDIRECT_VAR = bool(_LEGACY_REDIRECT_ENV and not _REDIRECT_ENV)
 
 # Login rate limiting: per source IP, max attempts within the window.
 LOGIN_MAX_ATTEMPTS = 5
@@ -68,8 +73,31 @@ PURGE_INTERVAL_SECONDS = 60
 
 
 def _canon(url: str | None) -> str | None:
-    """Canonical form for comparing resource identifiers."""
-    return str(url).rstrip("/").lower() if url else None
+    """Canonical form for comparing URLs.
+
+    Scheme and host are case-insensitive per RFC 3986; the path is not, so
+    lowercasing the whole string would make /Callback and /callback the same
+    thing. Only a trailing slash is normalised away.
+    """
+    if not url:
+        return None
+    parsed = urlparse(str(url))
+    if not parsed.scheme or not parsed.netloc:
+        return str(url).rstrip("/")
+    rest = parsed.path.rstrip("/")
+    if parsed.query:
+        rest += "?" + parsed.query
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{rest}"
+
+
+ALLOWED_REDIRECT_URIS = tuple(
+    c for c in (_canon(u) for u in (_REDIRECT_ENV or _LEGACY_REDIRECT_ENV).split(",") if u.strip()) if c
+)
+
+
+def redirect_uri_allowed(uri: str | None) -> bool:
+    """Exact match against the allowlist. Empty allowlist permits nothing."""
+    return bool(ALLOWED_REDIRECT_URIS) and _canon(uri) in ALLOWED_REDIRECT_URIS
 
 _lock = Lock()
 
@@ -154,6 +182,23 @@ def _init_db() -> None:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {coldef}")
             except sqlite3.OperationalError:
                 pass
+
+        # A token with no grant cannot be revoked as part of one: revoking it
+        # deletes only itself and leaves its siblings working. Nothing was ever
+        # stored that says which tokens belonged together, so they cannot be
+        # repaired, only kept in a state where revocation silently under-deletes.
+        # They are invalidated instead. The cost is reconnecting once. This stays
+        # in place permanently as an invariant: no grant, no token.
+        orphaned = sum(
+            conn.execute(f"DELETE FROM {table} WHERE grant_id IS NULL").rowcount
+            for table in ("access_tokens", "refresh_tokens")
+        )
+        if orphaned:
+            print(
+                f"Invalidated {orphaned} token(s) issued before grant tracking; "
+                "they could not be revoked as a grant. Reconnect the client to sign in again.",
+                flush=True,
+            )
 
 
 def _migrate_plaintext_tokens() -> None:
@@ -247,8 +292,11 @@ class ShellAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Refr
         # Tokens are minted for a specific resource; anything issued for a
         # different one must not be accepted here.
         self._resource = _canon(f"{self._base_url}/mcp")
-        # ip -> list of failed-attempt timestamps
-        self._failed_attempts: dict[str, list[float]] = {}
+        # (bucket, ip) -> list of failed-attempt timestamps. Bucketed because a
+        # single counter means visiting the passkey setup page a few times
+        # exhausts the budget for signing in, locking the operator out of their
+        # own server without anything having gone wrong.
+        self._failed_attempts: dict[tuple[str, str], list[float]] = {}
 
     # ---- clients (DCR) ----
 
@@ -260,12 +308,12 @@ class ShellAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Refr
         return OAuthClientInformationFull.model_validate_json(row["data"])
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
-        if not ALLOWED_REDIRECT_PREFIXES:
+        if not ALLOWED_REDIRECT_URIS:
             raise RegistrationError(
                 error="invalid_redirect_uri",
                 error_description=(
                     "This server does not accept client registrations. Set "
-                    "MCP_ALLOWED_REDIRECT_PREFIXES to the callback URLs you trust."
+                    "MCP_ALLOWED_REDIRECT_URIS to the callback URLs you trust."
                 ),
             )
         uris = [str(u) for u in (client_info.redirect_uris or [])]
@@ -275,7 +323,7 @@ class ShellAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Refr
                 error_description="At least one redirect_uri is required.",
             )
         for uri in uris:
-            if not uri.startswith(ALLOWED_REDIRECT_PREFIXES):
+            if not redirect_uri_allowed(uri):
                 raise RegistrationError(
                     error="invalid_redirect_uri",
                     error_description=f"redirect_uri {uri} is not on this server's allowlist.",
@@ -299,7 +347,7 @@ class ShellAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Refr
 
         # Checked again here, not just at registration: a client row may predate
         # the allowlist, or have been registered while it was unset.
-        if ALLOWED_REDIRECT_PREFIXES and not str(params.redirect_uri).startswith(ALLOWED_REDIRECT_PREFIXES):
+        if not redirect_uri_allowed(params.redirect_uri):
             raise AuthorizeError(
                 error="invalid_request",
                 error_description="redirect_uri is not on this server's allowlist.",
@@ -329,15 +377,15 @@ class ShellAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Refr
 
     # ---- login: called by the custom /login route in server.py, not by the SDK ----
 
-    def _client_ip_blocked(self, ip: str) -> bool:
-        attempts = self._failed_attempts.get(ip, [])
+    def _client_ip_blocked(self, ip: str, bucket: str = "login") -> bool:
+        key = (bucket, ip)
         cutoff = time.time() - LOGIN_WINDOW_SECONDS
-        attempts = [t for t in attempts if t > cutoff]
-        self._failed_attempts[ip] = attempts
+        attempts = [t for t in self._failed_attempts.get(key, []) if t > cutoff]
+        self._failed_attempts[key] = attempts
         return len(attempts) >= LOGIN_MAX_ATTEMPTS
 
-    def _record_failed_attempt(self, ip: str) -> None:
-        self._failed_attempts.setdefault(ip, []).append(time.time())
+    def _record_failed_attempt(self, ip: str, bucket: str = "login") -> None:
+        self._failed_attempts.setdefault((bucket, ip), []).append(time.time())
 
     def get_login_session(self, session_id: str) -> sqlite3.Row | None:
         with _connect() as conn:
@@ -348,8 +396,8 @@ class ShellAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Refr
             return None
         return row
 
-    def is_blocked(self, ip: str) -> bool:
-        return self._client_ip_blocked(ip)
+    def is_blocked(self, ip: str, bucket: str = "login") -> bool:
+        return self._client_ip_blocked(ip, bucket)
 
     def get_login_context(self, session_id: str) -> dict | None:
         """Who is asking, for display on the login page. Authenticating without
@@ -437,8 +485,8 @@ class ShellAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Refr
         responsibility (is_blocked / record_failed_attempt), same as verify_signature."""
         return self._verify_ssh_signature(nonce, signature_text, namespace=namespace)
 
-    def record_failed_attempt(self, ip: str) -> None:
-        self._record_failed_attempt(ip)
+    def record_failed_attempt(self, ip: str, bucket: str = "login") -> None:
+        self._record_failed_attempt(ip, bucket)
 
     def complete_login(self, session_id: str) -> str | None:
         """Password verified: mint an auth code, consume the session, return the
@@ -446,6 +494,11 @@ class ShellAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Refr
         session is missing/expired."""
         row = self.get_login_session(session_id)
         if row is None:
+            return None
+        # Checked once more at the last moment. A session opened while the
+        # allowlist was wider, or before it was set at all, must not be able to
+        # complete against a callback that is no longer permitted.
+        if not redirect_uri_allowed(row["redirect_uri"]):
             return None
 
         code = secrets.token_urlsafe(32)
@@ -577,7 +630,7 @@ class ShellAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Refr
             grant_id = prev["grant_id"] if prev is not None else None
             resource = prev["resource"] if prev is not None else None
             if not grant_id:
-                grant_id = secrets.token_urlsafe(16)  # token predates grant tracking
+                grant_id = secrets.token_urlsafe(16)  # unreachable; see _init_db
 
             # The access token issued alongside the refresh token being replaced
             # does not survive rotation; otherwise revoking the refresh token
@@ -642,6 +695,9 @@ class ShellAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Refr
                 (hashed, hashed),
             ).fetchone()
             grant_id = row["grant_id"] if row is not None else None
+            # Every token carries a grant since the migration in _init_db, so the
+            # single-token branch should be unreachable. It stays as a guard: if
+            # a grant is ever missing, delete the token rather than nothing.
             if grant_id:
                 conn.execute("DELETE FROM access_tokens WHERE grant_id = ?", (grant_id,))
                 conn.execute("DELETE FROM refresh_tokens WHERE grant_id = ?", (grant_id,))
