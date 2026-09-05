@@ -79,6 +79,7 @@ Two things are your responsibility and cannot be fixed in this code:
 | `logcrypt.py` | Encrypt-on-append audit logging |
 | `decrypt_log.py` | Offline reader for the audit log |
 | `test_webauthn_setup.py` | Checks for the WebAuthn setup path |
+| `config.py` | Loads `.env`, and the first-run setup that writes it |
 
 ## Install
 
@@ -86,31 +87,31 @@ Two things are your responsibility and cannot be fixed in this code:
 git clone <this repo> && cd mcp-shell-server
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-cp .env.example .env      # then edit it
-mkdir -p data
+.venv/bin/python server.py
 ```
 
-Everything user-specific lives in `.env`: your public URL, the signing principal,
-and the passkey identity. Nothing in the source assumes a particular hostname or
-username.
+The first run has nothing to go on, so it asks. It walks through the public URL,
+the callbacks allowed to register, the signing principal, the bind address, and
+whether commands should run as a separate user. Then it offers to write your SSH
+public key into `data/allowed_signers` with the matching principal, and to
+generate an audit key pair, showing the private half once so you can store it off
+the machine.
 
-Add the public half of an SSH key to `data/allowed_signers`, in the format
-`ssh-keygen -Y verify` expects. The first field must equal
-`MCP_SIGNATURE_PRINCIPAL`:
+Answers land in `.env`, owner-readable only. Re-run the questions any time with
+`.venv/bin/python server.py --setup`, or edit the file directly; `.env.example`
+documents every setting including the few setup does not ask about.
 
-```
-mcp-user ssh-ed25519 AAAAC3Nz...
-```
+Nothing assumes a particular hostname, username, or account name. `.env` is the
+whole configuration.
 
-Set `MCP_WEBAUTHN_USER_ID` before registering your first passkey. The user id is
-written into the credential at registration, so changing it later means
-re-registering.
+`.env` is read by the server itself and by systemd's `EnvironmentFile`, so the
+same file works either way. Real environment variables win over the file, so a
+single setting can be overridden for one run without editing anything.
 
-Generate an audit key pair off the box, and install only the public half as
-`data/log_recipient.pub`.
-
-Run it directly with `.venv/bin/python server.py`, or install
-`mcp-shell.service.example` as a systemd unit after editing the paths and user.
+Under systemd there is no terminal to ask at, so a missing configuration exits
+with an explanation rather than hanging on a prompt at boot. Run setup once from
+a shell first. Install `mcp-shell.service.example` as a unit after editing the
+paths and user.
 
 Bind to loopback and put a tunnel or reverse proxy in front for TLS. The server
 expects to be reached at `MCP_BASE_URL`.

@@ -4,6 +4,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -12,6 +13,14 @@ from urllib.parse import parse_qs, urlparse
 import anyio
 import anyio.to_thread
 from pydantic import AnyHttpUrl
+
+import config
+
+# Configuration has to be resolved before anything that reads it at import time,
+# which is why this call sits above the remaining imports rather than with the
+# rest of the startup code. With no .env and no terminal this exits with an
+# explanation; with a terminal it runs first-run setup.
+config.ensure_configured(force="--setup" in sys.argv)
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
